@@ -1,0 +1,208 @@
+###################################SOURCE CODE###############################
+# Install required packages
+!pip install PyMuPDF pandas openpyxl
+
+# Import necessary libraries
+import fitz  # PyMuPDF
+import pandas as pd
+import os
+import re
+from collections import defaultdict
+from google.colab import files
+
+class PDFTableExtractor:
+    def __init__(self):
+        self.min_table_size = 3  # Minimum number of cells to consider as a table
+
+    def extract_tables_from_pdf(self, pdf_path, output_path=None):
+        """
+        Extract tables from PDF and save to Excel.
+
+        Args:
+            pdf_path (str): Path to the PDF file.
+            output_path (str, optional): Path to save the Excel file. If None, uses PDF name with .xlsx extension.
+
+        Returns:
+            str: Path to the saved Excel file.
+        """
+        if output_path is None:
+            # Handle filenames with spaces by ensuring proper path construction
+            base_name = os.path.basename(pdf_path)
+            file_name = os.path.splitext(base_name)[0]
+            output_path = file_name + ".xlsx"
+            print(f"Output will be saved to: {output_path}")
+
+        # Open the PDF
+        doc = fitz.open(pdf_path)
+
+        # Dictionary to store tables by page
+        all_tables = {}
+
+        for page_num, page in enumerate(doc):
+            print(f"Processing page {page_num + 1}...")
+            # Extract text with detailed layout information
+            blocks = page.get_text("dict")["blocks"]
+
+            # Extract tables from the page
+            tables = self._detect_tables(blocks)
+
+            if tables:
+                all_tables[f"Page {page_num + 1}"] = tables
+                print(f"Found {len(tables)} tables on page {page_num + 1}")
+            else:
+                print(f"No tables found on page {page_num + 1}")
+
+        # Save tables to Excel
+        if all_tables:
+            self._save_to_excel(all_tables, output_path)
+            print(f"Tables extracted and saved to {output_path}")
+        else:
+            print("No tables found in the PDF")
+
+        return output_path
+
+    def _detect_tables(self, blocks):
+        """
+        Detect tables in a page based on text blocks layout.
+
+        Args:
+            blocks (list): Text blocks from PyMuPDF.
+
+        Returns:
+            list: List of detected tables as pandas DataFrames.
+        """
+        tables = []
+
+        # Extract text lines with position information
+        lines_with_pos = []
+
+        for block in blocks:
+            if block.get("type") == 0:  # Text block
+                for line in block.get("lines", []):
+                    text = ""
+                    for span in line.get("spans", []):
+                        text += span.get("text", "")
+
+                    if text.strip():
+                        bbox = line.get("bbox")
+                        lines_with_pos.append((text, bbox))
+
+        # Sort lines by y-position to group them into rows
+        lines_with_pos.sort(key=lambda x: x[1][1])  # Sort by y0
+
+        # Group lines by similar y-position (same row)
+        rows = []
+        current_row = []
+
+        for i, (text, bbox) in enumerate(lines_with_pos):
+            if i == 0:
+                current_row.append((text, bbox))
+            else:
+                # Check if this line is on the same row as the previous one
+                prev_y = lines_with_pos[i-1][1][1]
+                current_y = bbox[1]
+
+                if abs(current_y - prev_y) < 5:  # Threshold for same row
+                    current_row.append((text, bbox))
+                else:
+                    # Start a new row
+                    if current_row:
+                        rows.append(current_row)
+                    current_row = [(text, bbox)]
+
+        # Add the last row
+        if current_row:
+            rows.append(current_row)
+
+        # Check if we have a potential table structure
+        # (Multiple rows with consistent number of columns)
+        if len(rows) >= 2:
+            # Count number of items in each row
+            row_item_counts = [len(row) for row in rows]
+
+            # Find rows with similar item counts (potential table rows)
+            counts = defaultdict(list)
+            for i, count in enumerate(row_item_counts):
+                counts[count].append(i)
+
+            # Find the most common item count
+            max_count = 0
+            max_indices = []
+            for count, indices in counts.items():
+                if count >= 2 and len(indices) > len(max_indices):  # At least 2 columns
+                    max_count = count
+                    max_indices = indices
+
+            # If we have enough rows with consistent column count
+            if max_count >= 2 and len(max_indices) >= 2:
+                # Extract the table rows
+                table_rows = [rows[i] for i in max_indices]
+
+                # Convert to a pandas DataFrame
+                data = []
+                for row in table_rows:
+                    # Sort items by x-position
+                    row.sort(key=lambda x: x[1][0])
+                    # Clean each cell to remove illegal characters
+                    cleaned_row = [self._clean_text(item[0]) for item in row]
+                    data.append(cleaned_row)
+
+                tables.append(pd.DataFrame(data))
+
+        return tables
+
+    def _clean_text(self, text):
+        """
+        Clean text by removing illegal characters that are not allowed in Excel.
+
+        Args:
+            text (str): Text to clean.
+
+        Returns:
+            str: Cleaned text.
+        """
+        # Remove non-printable and control characters
+        cleaned_text = re.sub(r'[\x00-\x1F\x7F]', '', text)
+        return cleaned_text
+
+    def _save_to_excel(self, all_tables, output_path):
+        """
+        Save tables to Excel file.
+
+        Args:
+            all_tables (dict): Dictionary of tables by page.
+            output_path (str): Path to save the Excel file.
+        """
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            for page_name, tables in all_tables.items():
+                for i, table in enumerate(tables):
+                    sheet_name = f"{page_name}_Table{i+1}"
+                    # Excel sheet names have a 31 character limit
+                    if len(sheet_name) > 31:
+                        sheet_name = sheet_name[:31]
+                    table.to_excel(writer, sheet_name=sheet_name, index=False)
+
+# Main execution code
+# Upload your PDF file
+from google.colab import files
+import os
+print("Please select your PDF file to upload:")
+uploaded = files.upload()
+
+# Get the filename of the uploaded PDF
+pdf_filename = next(iter(uploaded))
+print(f"Processing file: {pdf_filename}")
+
+# Create the extractor and process the PDF
+extractor = PDFTableExtractor()
+output_file = extractor.extract_tables_from_pdf(pdf_filename)
+
+# Verify the file exists before downloading
+if os.path.exists(output_file):
+    print(f"Table extraction complete. Downloading {output_file}...")
+    files.download(output_file)
+else:
+    print(f"Error: The output file '{output_file}' was not found. Check if the extraction was successful.")
+    # List files in the current directory to help debug
+    print("Files in the current directory:")
+    print(os.listdir('.'))
